@@ -1,14 +1,25 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel
 import numpy as np
 from typing import Optional
 from typing import List, Dict
 import networkx as nx
-from fastapi import HTTPException
-
-
+from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI(title="PERT Simulation API")
+
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 
 
 # Define what a task looks like when frontend sends JSON
@@ -164,10 +175,6 @@ def pert_analysis(tasks: List[TaskIn]):
         ))
 
 
-
-
-
-
     # Step 7: Critical Path (tasks with 0 slack)
     critical_path = [t.id for t in timings if t.slack == 0.0]
     mc_result = run_monte_carlo(tasks, iterations=1000)
@@ -180,7 +187,7 @@ def pert_analysis(tasks: List[TaskIn]):
     )
     
 
-  # At the top of main.py, after imports
+  # in memory storage
 stored_tasks: List[TaskIn] = []
 
 
@@ -194,22 +201,123 @@ def set_tasks(tasks: List[TaskIn]):
 
 # Endpoint to update a task
 @app.put("/update-task")
-def update_task(updated: TaskIn):
+async def update_task(updated: TaskIn):
     global stored_tasks
     for i, task in enumerate(stored_tasks):
         if task.id == updated.id:
             stored_tasks[i] = updated
+            # recalc after update
+            result = pert_analysis(stored_tasks)
+            # broadcast to WebSocket clients
+            await manager.broadcast(result.dict())
             return {"message": f"Task {updated.id} updated successfully"}
     raise HTTPException(status_code=404, detail=f"Task {updated.id} not found")
 
 
-# Endpoint to recalculate
-@app.get("/recalculate", response_model=PERTResult)
-def recalc():
+## Compare Pert endpoint
+@app.post("/compare-pert")
+def compare_pert():
     global stored_tasks
     if not stored_tasks:
-        raise HTTPException(status_code=400, detail="No tasks set yet")
-    return pert_analysis(stored_tasks)
+        raise HTTPException(status_code=400, detail="No tasks available")
+
+    tasks = stored_tasks  # alias for readability
+
+    # --- Classical PERT expected duration ---
+    classical_durations = {
+        t.id: (t.optimistic + 4 * t.most_likely + t.pessimistic) / 6
+        for t in tasks
+    }
+
+    completed = {}
+    remaining = set(classical_durations.keys())
+
+    while remaining:
+        for tid in list(remaining):
+            task = next(t for t in tasks if t.id == tid)
+            deps = task.dependencies
+            if all(dep in completed for dep in deps):
+                max_dep = max([completed[dep] for dep in deps], default=0)
+                completed[tid] = max_dep + classical_durations[tid]
+                remaining.remove(tid)
+
+    classical_total = max(completed.values())
+
+    # --- Enhanced PERT (Monte Carlo Simulation) ---
+    num_simulations = 1000
+    total_times = []
+
+    for _ in range(num_simulations):
+        sampled = {
+            t.id: np.random.triangular(t.optimistic, t.most_likely, t.pessimistic)
+            for t in tasks
+        }
+        completed_sim = {}
+        remaining_sim = set(sampled.keys())
+
+        while remaining_sim:
+            for tid in list(remaining_sim):
+                task = next(t for t in tasks if t.id == tid)
+                deps = task.dependencies
+                if all(dep in completed_sim for dep in deps):
+                    max_dep = max([completed_sim[dep] for dep in deps], default=0)
+                    completed_sim[tid] = max_dep + sampled[tid]
+                    remaining_sim.remove(tid)
+
+        total_times.append(max(completed_sim.values()))
+
+    # Compute statistics from Monte Carlo
+    enhanced_mean = np.mean(total_times)
+    enhanced_p10 = np.percentile(total_times, 10)
+    enhanced_p90 = np.percentile(total_times, 90)
+
+    return {
+        "classical_pert": {
+            "expected_duration": round(classical_total, 2)
+        },
+        "enhanced_pert": {
+            "mean_duration": round(enhanced_mean, 2),
+            "p10": round(enhanced_p10, 2),
+            "p90": round(enhanced_p90, 2)
+        },
+        "comparison": {
+            "difference_in_days": round(enhanced_mean - classical_total, 2),
+            "interpretation": (
+                "Enhanced PERT accounts for uncertainty with probability ranges, "
+                "while classical PERT gives only a fixed expected value."
+            )
+        }
+    }
+
+
+
+#  WebSocket Manager
+class ConnectionManager:
+    def __init__(self):
+        self.active_connections: List[WebSocket] = []
+
+    async def connect(self, websocket: WebSocket):
+        await websocket.accept()
+        self.active_connections.append(websocket)
+
+    def disconnect(self, websocket: WebSocket):
+        self.active_connections.remove(websocket)
+
+    async def broadcast(self, message: dict):
+        for connection in self.active_connections:
+            await connection.send_json(message)
+
+manager = ConnectionManager()
+
+#  WebSocket Endpoint
+@app.websocket("/ws/updates")
+async def websocket_endpoint(websocket: WebSocket):
+    await manager.connect(websocket)
+    try:
+        while True:
+            await websocket.receive_text()  # keeps connection alive
+    except WebSocketDisconnect:
+        manager.disconnect(websocket)
 
 
 @app.get("/")
