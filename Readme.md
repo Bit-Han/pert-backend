@@ -203,7 +203,7 @@ Create and activate a virtual environment.
 
 
 
-Run pip install -r requirements.txt
+Run pip install 
 
 **Launch the server:**
 uvicorn main:app --reload
