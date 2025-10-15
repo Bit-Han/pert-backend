@@ -12,7 +12,7 @@ app = FastAPI(title="PERT Simulation API")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-        "https://pert-frontend.onrender.com/",
+        "https://pert-frontend.onrender.com",
     ],
     allow_credentials=True,
     allow_methods=["*"],
